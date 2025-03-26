@@ -34,7 +34,7 @@ services:
     environment:
       <<: *backend-app-env
       # comment out after initial setup
-      BOOTSTRAP: "true"
+      BOOTSTRAP: "false"
     # README: To add local env variables uncomment the following line and add a .env file in the root directory
     env_file:
       - .env
