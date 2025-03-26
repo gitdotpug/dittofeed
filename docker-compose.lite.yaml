@@ -27,8 +27,6 @@ services:
       resources:
         limits:
           memory: ${LITE_CONTAINER_MEM_LIMIT:-1024}m
-    ports:
-      - "3000:3000"
     depends_on:
       - postgres
       - temporal
