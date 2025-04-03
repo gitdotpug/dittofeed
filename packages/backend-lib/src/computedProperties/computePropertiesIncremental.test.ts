@@ -24,6 +24,7 @@ import {
   AppFileType,
   BlobStorageFile,
   ComputedPropertyAssignment,
+  ComputedPropertyPeriod,
   ComputedPropertyStep,
   EventType,
   InternalEventType,
@@ -34,6 +35,7 @@ import {
   PerformedUserPropertyDefinition,
   RelationalOperators,
   SavedHasStartedJourneyResource,
+  SavedJourneyResource,
   SavedSegmentResource,
   SavedUserPropertyResource,
   SegmentHasBeenOperatorComparator,
@@ -42,7 +44,6 @@ import {
   SegmentResource,
   SubscriptionChange,
   SubscriptionChangeEvent,
-  SubscriptionGroupSegmentNode,
   SubscriptionGroupType,
   UserPropertyDefinitionType,
   UserPropertyOperatorType,
@@ -134,6 +135,53 @@ async function getUserCounts(workspaceId: string) {
     stateUserCount,
     assignmentUserCount,
   };
+}
+
+async function readPeriods({
+  workspaceId,
+}: {
+  workspaceId: string;
+}): Promise<ComputedPropertyPeriod[]> {
+  const periods = await db()
+    .select()
+    .from(schema.computedPropertyPeriod)
+    .where(eq(schema.computedPropertyPeriod.workspaceId, workspaceId));
+  return periods;
+}
+
+async function readUpdatedComputedPropertyState({
+  workspaceId,
+}: {
+  workspaceId: string;
+}): Promise<
+  {
+    workspace_id: string;
+    type: string;
+    computed_property_id: string;
+    state_id: string;
+    user_id: string;
+    computed_at: string;
+  }[]
+> {
+  const qb = new ClickHouseQueryBuilder();
+  const query = `
+    select *
+    from updated_computed_property_state
+    where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
+  `;
+  const response = await clickhouseClient().query({
+    query,
+    query_params: qb.getQueries(),
+  });
+  const values = await response.json<{
+    workspace_id: string;
+    type: string;
+    computed_property_id: string;
+    state_id: string;
+    user_id: string;
+    computed_at: string;
+  }>();
+  return values.data;
 }
 
 async function readAssignments({
@@ -300,14 +348,15 @@ async function readResolvedSegmentStates({
   workspaceId,
 }: {
   workspaceId: string;
-}): Promise<ResolvedSegmentState[]> {
+}): Promise<(ResolvedSegmentState & { computed_at: string })[]> {
   const qb = new ClickHouseQueryBuilder();
   const query = `
     select
       segment_id,
       state_id,
       user_id,
-      segment_state_value
+      segment_state_value,
+      computed_at
     from resolved_segment_state
     where workspace_id = ${qb.addQueryValue(workspaceId, "String")}
   `;
@@ -316,7 +365,9 @@ async function readResolvedSegmentStates({
       query,
       query_params: qb.getQueries(),
     })
-  ).json()) satisfies { data: ResolvedSegmentState[] };
+  ).json()) satisfies {
+    data: (ResolvedSegmentState & { computed_at: string })[];
+  };
 
   return response.data;
 }
@@ -501,6 +552,7 @@ enum EventsStepType {
   Sleep = "Sleep",
   Debug = "Debug",
   UpdateComputedProperty = "UpdateComputedProperty",
+  UpdateJourney = "UpdateJourney",
 }
 
 interface StepContext {
@@ -529,6 +581,14 @@ interface ComputePropertiesStep {
 interface DebugAssignmentsStep {
   type: EventsStepType.Debug;
   userId?: string;
+  description?: string;
+  queries?: ((
+    ctx: StepContext,
+    qb: ClickHouseQueryBuilder,
+  ) => {
+    query: string;
+    name: string;
+  })[];
 }
 
 interface SleepStep {
@@ -565,6 +625,8 @@ interface AssertStep {
 
 type TestUserProperty = Pick<UserPropertyResource, "name" | "definition">;
 type TestSegment = Pick<SegmentResource, "name" | "definition">;
+type TestJourneyResource = Pick<SavedJourneyResource, "name" | "definition">;
+
 interface TestJourney {
   name: string;
   entrySegmentName: string;
@@ -576,6 +638,14 @@ interface UpdateComputedPropertyStep {
   segments?: TestSegment[];
 }
 
+interface UpdateJourneyStep {
+  type: EventsStepType.UpdateJourney;
+  journeys: (
+    | TestJourneyResource
+    | ((ctx: StepContext) => TestJourneyResource)
+  )[];
+}
+
 type TableStep =
   | SubmitEventsStep
   | SubmitEventsTimesStep
@@ -583,7 +653,8 @@ type TableStep =
   | AssertStep
   | SleepStep
   | DebugAssignmentsStep
-  | UpdateComputedPropertyStep;
+  | UpdateComputedPropertyStep
+  | UpdateJourneyStep;
 
 interface TableTest {
   description: string;
@@ -593,6 +664,54 @@ interface TableTest {
   segments?: TestSegment[];
   journeys?: TestJourney[];
   steps: TableStep[];
+}
+
+async function upsertJourneys({
+  workspaceId,
+  now,
+  journeys,
+  context,
+}: {
+  workspaceId: string;
+  journeys: (
+    | TestJourneyResource
+    | ((ctx: StepContext) => TestJourneyResource)
+  )[];
+  now: number;
+  context: StepContext;
+}): Promise<SavedHasStartedJourneyResource[]> {
+  await Promise.all(
+    journeys.map((j) => {
+      const resource = typeof j === "function" ? j(context) : j;
+      return upsert({
+        table: schema.journey,
+        target: [schema.journey.workspaceId, schema.journey.name],
+        values: {
+          id: randomUUID(),
+          workspaceId,
+          name: resource.name,
+          status: "Running",
+          definition: resource.definition,
+          createdAt: new Date(now),
+          updatedAt: new Date(now),
+        },
+        set: {
+          updatedAt: new Date(now),
+        },
+      });
+    }),
+  );
+  const journeyModels = await db()
+    .select()
+    .from(schema.journey)
+    .where(eq(schema.journey.workspaceId, workspaceId));
+  return journeyModels.map((j) => {
+    const resource = unwrap(toJourneyResource(j));
+    if (resource.status === "NotStarted") {
+      throw new Error("journey should have been started");
+    }
+    return resource;
+  });
 }
 
 async function upsertComputedProperties({
@@ -7244,6 +7363,155 @@ describe("computeProperties", () => {
         },
       ],
     },
+    {
+      description: "retroactively signals a segment entry journey",
+      userProperties: [
+        {
+          name: "id",
+          definition: {
+            type: UserPropertyDefinitionType.Id,
+          },
+        },
+      ],
+      segments: [
+        {
+          name: "isMax",
+          definition: {
+            entryNode: {
+              type: SegmentNodeType.Trait,
+              id: "1",
+              path: "firstName",
+              operator: {
+                type: SegmentOperatorType.Equals,
+                value: "Max",
+              },
+            },
+            nodes: [],
+          },
+        },
+      ],
+      steps: [
+        {
+          type: EventsStepType.SubmitEvents,
+          events: [
+            {
+              type: EventType.Identify,
+              offsetMs: -100,
+              userId: "user-1",
+              traits: {
+                firstName: "Max",
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "user is in the segment prior to the journey being created",
+          users: [
+            {
+              id: "user-1",
+              segments: {
+                isMax: true,
+              },
+            },
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.UpdateJourney,
+          journeys: [
+            (ctx) => ({
+              name: "isMaxJourney",
+              definition: {
+                entryNode: {
+                  type: JourneyNodeType.SegmentEntryNode,
+                  segment: ctx.segments.find((s) => s.name === "isMax")!.id,
+                  child: JourneyNodeType.ExitNode,
+                },
+                nodes: [],
+                exitNode: {
+                  type: JourneyNodeType.ExitNode,
+                },
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 3 * 24 * 60 * 60 * 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          description:
+            "journey signals for segment which has undergone several compute property periods before journey was created",
+          journeys: [
+            {
+              journeyName: "isMaxJourney",
+              times: 1,
+            },
+          ],
+        },
+        {
+          type: EventsStepType.UpdateJourney,
+          journeys: [
+            (ctx) => ({
+              name: "otherIsMaxJourney",
+              definition: {
+                entryNode: {
+                  type: JourneyNodeType.SegmentEntryNode,
+                  segment: ctx.segments.find((s) => s.name === "isMax")!.id,
+                  child: JourneyNodeType.ExitNode,
+                },
+                nodes: [],
+                exitNode: {
+                  type: JourneyNodeType.ExitNode,
+                },
+              },
+            }),
+          ],
+        },
+        {
+          type: EventsStepType.Sleep,
+          timeMs: 3 * 24 * 60 * 60 * 1000,
+        },
+        {
+          type: EventsStepType.ComputeProperties,
+        },
+        {
+          type: EventsStepType.Assert,
+          journeys: [
+            {
+              journeyName: "isMaxJourney",
+              times: 1,
+            },
+            {
+              journeyName: "otherIsMaxJourney",
+              times: 1,
+            },
+          ],
+        },
+      ],
+    },
   ];
   const only: null | string =
     tests.find((t) => t.only === true)?.description ?? null;
@@ -7281,8 +7549,8 @@ describe("computeProperties", () => {
       now,
     });
 
-    const journeys = await Promise.all(
-      test.journeys?.map(({ name, entrySegmentName }) => {
+    let journeys: SavedHasStartedJourneyResource[] = await Promise.all(
+      test.journeys?.map(async ({ name, entrySegmentName }) => {
         const segment = segments.find((s) => s.name === entrySegmentName);
         if (!segment) {
           throw new Error(
@@ -7300,7 +7568,7 @@ describe("computeProperties", () => {
             type: JourneyNodeType.ExitNode,
           },
         };
-        return insert({
+        const journeyModel = await insert({
           table: schema.journey,
           values: {
             id: randomUUID(),
@@ -7312,16 +7580,12 @@ describe("computeProperties", () => {
             createdAt: new Date(now),
           },
         }).then(unwrap);
-      }) ?? [],
-    );
-    const journeyResources: SavedHasStartedJourneyResource[] = journeys.map(
-      (j) => {
-        const resource = unwrap(toJourneyResource(j));
+        const resource = unwrap(toJourneyResource(journeyModel));
         if (resource.status === "NotStarted") {
           throw new Error("journey should have been started");
         }
         return resource;
-      },
+      }) ?? [],
     );
 
     for (const step of test.steps) {
@@ -7381,27 +7645,64 @@ describe("computeProperties", () => {
           break;
         }
         case EventsStepType.Debug: {
-          const [assignments, states, resolvedSegmentStates] =
-            await Promise.all([
-              readAssignments({ workspaceId }),
-              readDisaggregatedStates({ workspaceId }),
-              readResolvedSegmentStates({
-                workspaceId,
-              }),
-            ]);
+          const debugQueries = step.queries?.map(async (q) => {
+            const qb = new ClickHouseQueryBuilder();
+            const { query, name } = q(stepContext, qb);
+            const result = await clickhouseClient().query({
+              query,
+              query_params: qb.getQueries(),
+            });
+            const { data } = await result.json();
+            const values = {
+              name,
+              query,
+              data,
+            };
+            return values;
+          });
+          const [
+            assignments,
+            states,
+            resolvedSegmentStates,
+            periods,
+            updatedComputedPropertyState,
+            debugQueryData,
+          ] = await Promise.all([
+            readAssignments({ workspaceId }),
+            readDisaggregatedStates({ workspaceId }),
+            readResolvedSegmentStates({
+              workspaceId,
+            }),
+            readPeriods({ workspaceId }),
+            readUpdatedComputedPropertyState({ workspaceId }),
+            Promise.all(debugQueries ?? []),
+          ]);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const logged: Record<string, any> = {
+            assignments: assignments.filter((a) =>
+              step.userId ? a.user_id === step.userId : true,
+            ),
+            states: states.filter((s) =>
+              step.userId ? s.user_id === step.userId : true,
+            ),
+            resolvedSegmentStates: resolvedSegmentStates.filter((s) =>
+              step.userId ? s.user_id === step.userId : true,
+            ),
+            updatedComputedPropertyState: updatedComputedPropertyState.filter(
+              (s) => (step.userId ? s.user_id === step.userId : true),
+            ),
+            periods,
+            stepContext,
+          };
+          for (const { name, query, data } of debugQueryData) {
+            logged[name] = {
+              query,
+              data,
+            };
+          }
           logger().warn(
-            {
-              assignments: assignments.filter((a) =>
-                step.userId ? a.user_id === step.userId : true,
-              ),
-              states: states.filter((s) =>
-                step.userId ? s.user_id === step.userId : true,
-              ),
-              resolvedSegmentStates: resolvedSegmentStates.filter((s) =>
-                step.userId ? s.user_id === step.userId : true,
-              ),
-            },
-            "debug clickhouse values",
+            logged,
+            `debug clickhouse values:${step.description ? ` ${step.description}` : ""}`,
           );
           break;
         }
@@ -7429,7 +7730,7 @@ describe("computeProperties", () => {
             workspaceId,
             segments,
             integrations: [],
-            journeys: journeyResources,
+            journeys,
             userProperties,
             now,
           });
@@ -7670,7 +7971,7 @@ describe("computeProperties", () => {
           await Promise.all(usersAssertions);
 
           for (const assertedJourney of step.journeys ?? []) {
-            const journey = journeyResources.find(
+            const journey = journeys.find(
               (j) => j.name === assertedJourney.journeyName,
             );
             if (!journey) {
@@ -7699,6 +8000,15 @@ describe("computeProperties", () => {
           });
           segments = computedProperties.segments;
           userProperties = computedProperties.userProperties;
+          break;
+        }
+        case EventsStepType.UpdateJourney: {
+          journeys = await upsertJourneys({
+            workspaceId,
+            now,
+            journeys: step.journeys,
+            context: stepContext,
+          });
           break;
         }
         default:

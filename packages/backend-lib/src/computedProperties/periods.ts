@@ -183,10 +183,12 @@ export async function createPeriods({
   }
 
   await db().transaction(async (tx) => {
+    logger().debug({ newPeriods }, "Creating periods");
     await tx
       .insert(dbComputedPropertyPeriod)
       .values(newPeriods)
       .onConflictDoNothing();
+    logger().debug("Deleted periods");
     await tx
       .delete(dbComputedPropertyPeriod)
       .where(
@@ -353,8 +355,7 @@ export async function findDueWorkspaceMaxTos({
         sql`(to_timestamp(${timestampNow}) - ${aggregatedMax}) > ${secondsInterval}::interval`,
       ),
     )
-    // Use `ASC nulls first` in some SQL dialects if needed, or rely on drizzle's `sql` expression
-    .orderBy(sql`${aggregatedMax} ASC`)
+    .orderBy(sql`${aggregatedMax} ASC NULLS FIRST`)
     .limit(limit);
 
   return periodsQuery;
